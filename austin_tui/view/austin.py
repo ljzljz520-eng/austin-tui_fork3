@@ -68,6 +68,8 @@ class AustinView(View):
 
         self._stopped = False
 
+        self.file_mode = False
+
         self.view_mode = AustinViewMode.LIVE
 
     def on_exception(self, exc: Exception) -> None:
@@ -176,7 +178,7 @@ class AustinView(View):
 
     async def on_play_pause(self, _: Any = None) -> bool:
         """Play/pause handler."""
-        if self._stopped:
+        if self._stopped or self.file_mode:
             return False
 
         self.play_pause_cmd.toggle()

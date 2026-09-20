@@ -296,6 +296,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>. -->
   <aui:signal key="g" handler="on_graph_selected"     />
   <aui:signal key="s" handler="on_save"               />
   <aui:signal key="p" handler="on_play_pause"         />
+  <aui:signal key="c" handler="on_cancel_load"        />
 
   <aui:signal key="KEY_LEFT"  handler="on_previous_thread" />
   <aui:signal key="KEY_RIGHT" handler="on_next_thread"     />

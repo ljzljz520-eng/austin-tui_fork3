@@ -17,28 +17,34 @@
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
 import sys
+import threading
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from enum import Enum
 from pathlib import Path
 from textwrap import wrap
 from time import time
 from typing import Any
 from typing import Callable
+from typing import Dict
+from typing import List
 from typing import Optional
 from typing import Sequence
+from typing import Tuple
 
 from austin.aio import AsyncAustin
 from austin.cli import AustinArgumentParser
 from austin.cli import AustinCommandLineError
-from austin.errors import AustinError
 from austin.events import AustinMetadata
 from austin.events import AustinSample
 from austin.format.mojo import MojoStreamReader
 from austin.format.mojo import MojoStreamWriter
+from austin.stats import AustinStatsType
 from psutil import Process
 
 from austin_tui import AustinProfileMode
@@ -54,6 +60,7 @@ from austin_tui.adapters import ThreadDataAdapter
 from austin_tui.adapters import ThreadFullDataAdapter
 from austin_tui.adapters import ThreadNameAdapter
 from austin_tui.adapters import ThreadTopDataAdapter
+from austin_tui.model import FileLoadState
 from austin_tui.model import Model
 from austin_tui.view import ViewBuilder
 from austin_tui.view.austin import AustinView
@@ -71,6 +78,92 @@ class ThreadNav(Enum):
 def _print(text: str) -> None:
     for line in wrap(text, 78):
         print(line, file=sys.stderr)
+
+
+# MOJO "mode" metadata mapped to the TUI profile mode and stats container type.
+_MOJO_MODES: Dict[str, Tuple[AustinProfileMode, AustinStatsType]] = {
+    "wall": (AustinProfileMode.TIME, AustinStatsType.WALL),
+    "cpu": (AustinProfileMode.TIME, AustinStatsType.CPU),
+    "memory": (AustinProfileMode.MEMORY, AustinStatsType.MEMORY_ALLOC),
+}
+
+# Decode-worker batch budgets.
+_BATCH_EVENTS = 512
+_BATCH_BYTES = 1 << 18  # 256 KiB
+
+# Queue protocol sentinels.
+_EOF = object()
+_CANCEL = object()
+
+
+class _LoadError:
+    """A decode failure reported by the worker thread."""
+
+    __slots__ = ("error",)
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+
+def _decode_worker(
+    path: str,
+    queue: "asyncio.Queue[Any]",
+    loop: asyncio.AbstractEventLoop,
+    cancel_event: threading.Event,
+) -> None:
+    """Decode a MOJO file in a worker thread.
+
+    The stream is read sequentially and converted into batches of Austin
+    events that are posted back to the main event loop. Batches are flushed
+    on an event-count or byte budget to keep UI updates frequent without
+    flooding the loop. Any failure (truncation, corruption, I/O error) is
+    posted as a :class:`_LoadError`.
+    """
+
+    def _post(item: Any) -> bool:
+        """Post an item with back-pressure.
+
+        Returns False if cancellation was requested or the loop is gone.
+        """
+        while not cancel_event.is_set():
+            future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+            try:
+                future.result(timeout=0.2)
+                return True
+            except FutureTimeoutError:
+                continue
+            except Exception:
+                # Event loop closed or stopping: nothing to deliver to.
+                return False
+        return False
+
+    try:
+        with open(path, "rb") as stream:
+            reader = MojoStreamReader(stream)
+            batch: List[Any] = []
+            last_offset = 0
+            for event in reader:
+                if cancel_event.is_set():
+                    return
+
+                batch.append(event)
+                offset = reader._offset
+                if (
+                    len(batch) >= _BATCH_EVENTS
+                    or offset - last_offset >= _BATCH_BYTES
+                ):
+                    if not _post({"events": batch, "offset": offset}):
+                        return
+                    batch = []
+                    last_offset = offset
+
+            if batch:
+                if not _post({"events": batch, "offset": reader._offset}):
+                    return
+            _post(_EOF)
+    except Exception as exc:
+        # MojoParseError, ValueError (bad header/unknown events), OSError, ...
+        _post(_LoadError(exc))
 
 
 class AustinTUIArgumentParser(AustinArgumentParser):
@@ -129,6 +222,9 @@ class AustinTUIController:
         self._update_task: Optional[asyncio.Task[None]] = None
         self._exception: Optional[Exception] = None
         self._file_mode = False
+
+        self._cancel_event: Optional[threading.Event] = None
+        self._load_queue: Optional[asyncio.Queue[Any]] = None
 
         view_builder = ViewBuilder.from_resource(
             "austin_tui.view", "tui.austinui"
@@ -199,11 +295,13 @@ class AustinTUIController:
         """Start event."""
         pargs = AustinTUIArgumentParser().parse_args()  # type: ignore[call-arg]
 
-        if pargs.open is not None and pargs.open.exists():
+        if pargs.open is not None:
             await self.open_file(pargs.open)
             return
 
-        self.austin = AsyncAustin(self.on_sample, self.on_metadata, self.on_terminate)
+        self.austin = AsyncAustin(
+            self.on_sample, self.on_metadata, self.on_terminate
+        )
 
         await self.austin.start(args)
 
@@ -214,7 +312,9 @@ class AustinTUIController:
             (child_process,) = austin_process.children()
         command = child_process.cmdline()
 
-        mode = AustinProfileMode.MEMORY if pargs.memory else AustinProfileMode.TIME
+        mode = (
+            AustinProfileMode.MEMORY if pargs.memory else AustinProfileMode.TIME
+        )
         self.view.mode = mode
 
         """Austin ready callback."""
@@ -256,49 +356,264 @@ class AustinTUIController:
             raise self._exception
 
     async def open_file(self, path: Path) -> None:
-        """Open a MOJO file and replay its events into the TUI."""
-        print(f"📂 Opening MOJO file '{path}' ...", end="", flush=True)
-        try:
-            with path.open("rb") as f:
-                mojo = MojoStreamReader(f)
-                for event in mojo:
-                    if isinstance(event, AustinSample):
-                        await self.on_sample(event)
-                    elif isinstance(event, AustinMetadata):
-                        await self.on_metadata(event)
-        except AustinError as e:
-            self.shutdown()
-            _print(f"❌ Failed to open MOJO file '{path}': {e}")
-            exit(-1)
+        """Open a MOJO file with progressive, cancellable loading.
 
-        self.model.austin.set_command_line(["<MOJO file>", str(path)])
-
-        self._view_mode = AustinViewMode.FULL
+        The view is opened immediately against an empty staging model. The
+        decoder runs in a worker thread and publishes revisions that the UI
+        renders as they arrive. On EOF the staging model is validated and
+        atomically committed. On error or cancellation the staging model is
+        discarded and the previous snapshot (or an empty session) is
+        restored.
+        """
         self._file_mode = True
+        self._view_mode = AustinViewMode.FULL
+        self.view.file_mode = True
+        self._cancel_event = threading.Event()
 
+        try:
+            total_bytes = path.stat().st_size if path.is_file() else 0
+        except OSError:
+            total_bytes = 0
+
+        self.model.begin_file_load(path, total_bytes)
+
+        # Open the view straight away so that loading progress is visible.
         self._add_flamegraph_palette()
         self.view.open()
         self.view.on_mode_selected(AustinViewMode.FULL)
         self.view.live_mode_cmd.set_color("disabled")
         self.view.save_cmd.set_color("disabled")
-        self._update_task = asyncio.create_task(self.update_loop())
+        self.view.play_pause_cmd.set_color("disabled")
 
         self._formatter, self._scaler = (
-            (self.view.fmt_mem, self.view.scale_memory)
-            if self.view.mode == AustinProfileMode.MEMORY
-            else (self.view.fmt_time, self.view.scale_time)
+            self.view.fmt_time,
+            self.view.scale_time,
         )
+        self._update_task = asyncio.create_task(self.update_loop())
 
-        self.command_line()
-        self.update()
+        self._render_load_progress()
 
-        await self.stop()
+        state, error = await self._load_file(path)
+
+        await self._finish_load(state, error)
 
         try:
             if self.view._input_task is not None:
                 await self.view._input_task
         except asyncio.CancelledError:
             pass
+
+    async def _load_file(
+        self, path: Path
+    ) -> Tuple[FileLoadState, Optional[Exception]]:
+        """Validate the path and run the decode worker and batch consumer."""
+        if not path.exists():
+            return (
+                FileLoadState.FAILED,
+                FileNotFoundError(f"No such MOJO file: '{path}'"),
+            )
+        if not path.is_file():
+            return (
+                FileLoadState.FAILED,
+                OSError(f"Not a regular file: '{path}'"),
+            )
+
+        assert self._cancel_event is not None
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=8)
+        self._load_queue = queue
+
+        worker = loop.run_in_executor(
+            None,
+            _decode_worker,
+            str(path),
+            queue,
+            loop,
+            self._cancel_event,
+        )
+
+        try:
+            return await self._consume_batches(queue)
+        finally:
+            self._load_queue = None
+
+            if not worker.done():
+                # The consumer bailed out before the worker finished: stop it.
+                assert self._cancel_event is not None
+                self._cancel_event.set()
+
+            try:
+                await asyncio.wait_for(worker, timeout=2.0)
+            except Exception:
+                pass
+
+    async def _consume_batches(
+        self, queue: "asyncio.Queue[Any]"
+    ) -> Tuple[FileLoadState, Optional[Exception]]:
+        """Apply published batches to the staging model.
+
+        All model mutation happens here, on the main event-loop thread.
+        """
+        try:
+            while True:
+                item = await queue.get()
+
+                assert self._cancel_event is not None
+                if self._cancel_event.is_set() or item is _CANCEL:
+                    return FileLoadState.CANCELLED, None
+
+                if item is _EOF:
+                    if self.model.austin.mode is None:
+                        raise ValueError(
+                            "missing 'mode' metadata: the MOJO file is "
+                            "incompatible or corrupt"
+                        )
+                    return FileLoadState.READY, None
+
+                if isinstance(item, _LoadError):
+                    return FileLoadState.FAILED, item.error
+
+                for event in item["events"]:
+                    self._apply_event(event)
+
+                self.model.publish_revision(item["offset"])
+                self._render_load_progress()
+        except Exception as exc:
+            return FileLoadState.FAILED, exc
+
+    def _apply_event(self, event: Any) -> None:
+        """Apply a single Austin event to the staging model."""
+        if isinstance(event, AustinMetadata):
+            self._apply_metadata(event)
+        elif isinstance(event, AustinSample):
+            austin = self.model.austin
+            if austin.mode is None:
+                raise ValueError(
+                    "MOJO stream contains samples before 'mode' metadata: "
+                    "the file is incompatible or corrupt"
+                )
+            self._validate_sample(event)
+            austin.update(event)
+
+    def _validate_sample(self, sample: AustinSample) -> None:
+        """Reject incomplete samples produced by a truncated stream."""
+        if self.model.austin.mode is AustinProfileMode.MEMORY:
+            if sample.metrics.memory is None:
+                raise ValueError(
+                    "truncated MOJO stream: incomplete trailing sample "
+                    "(missing memory metric)"
+                )
+        elif sample.metrics.time is None:
+            raise ValueError(
+                "truncated MOJO stream: incomplete trailing sample "
+                "(missing time metric)"
+            )
+
+    def _apply_metadata(self, metadata: AustinMetadata) -> None:
+        """Configure the (staging) model from metadata, before samples."""
+        name, value = metadata.name, metadata.value
+
+        self.model.austin.add_metadata(name, value)
+
+        if name == "mode":
+            try:
+                profile_mode, stats_type = _MOJO_MODES[value]
+            except KeyError:
+                raise ValueError(
+                    f"incompatible MOJO 'mode' metadata: {value!r}"
+                ) from None
+
+            self.model.austin.set_mode(profile_mode, stats_type)
+            self.view.mode = profile_mode
+            self.view.set_mode(value)
+            self._formatter, self._scaler = (
+                (self.view.fmt_mem, self.view.scale_memory)
+                if profile_mode is AustinProfileMode.MEMORY
+                else (self.view.fmt_time, self.view.scale_time)
+            )
+        elif name == "python":
+            self.view.set_python(value)
+        elif name == "duration":
+            self.model.system._duration = int(value) / 1e6
+
+        # Austin/Python versions (compatibility information).
+        austin_version, python_version = self.model.austin.get_versions()
+        if name == "austin":
+            austin_version = value
+        if name == "python":
+            python_version = value
+        if austin_version and python_version:
+            self.model.austin.set_versions(austin_version, python_version)
+
+    def _render_load_progress(self) -> None:
+        """Render the current staging revision and load progress."""
+        model = self.model
+        path = model.file_path
+        name = path.name if path is not None else ""
+        pct = model.file_progress * 100
+        samples = model.austin.samples_count
+
+        model_refresh = self.update()
+
+        self.view.notification.set_text(
+            f"Loading {name} {pct:5.1f}%  {samples} samples  (C) cancel"
+        )
+
+        if self._view_mode is AustinViewMode.GRAPH:
+            self.view.flamegraph.draw()
+        elif model_refresh:
+            self.view.table.draw()
+
+        if self.view.root_widget is not None:
+            self.view.root_widget.refresh()
+
+    async def _finish_load(
+        self, state: FileLoadState, error: Optional[Exception]
+    ) -> None:
+        """Commit or roll back the load, then stop the live view behaviour."""
+        if state is FileLoadState.READY:
+            self.model.austin.set_command_line(
+                ["<MOJO file>", str(self.model.file_path)]
+            )
+            self.model.commit_file_load()
+            self.command_line()
+            self.update()
+        else:
+            self.model.abort_file_load(state, error)
+
+        # No more data is expected: cancel the update task and mark stopped.
+        await self.stop()
+
+        if state is FileLoadState.FAILED:
+            self.view.notification.set_text(
+                f"❌ Failed to open MOJO file: {error}"
+            )
+            self.view.notification.set_color("stopped")
+        elif state is FileLoadState.CANCELLED:
+            self.view.notification.set_text("Loading cancelled")
+            self.view.notification.set_color("notify")
+
+        if state is not FileLoadState.READY:
+            # Force a full redraw so that stale staging content is replaced
+            # by the restored snapshot (update() alone would not flag it).
+            self.set_thread()
+
+            # Labels that currently show staging statistics must be refreshed
+            # against the restored snapshot.
+            self.samples()
+            self.duration()
+            self.cpu()  # type: ignore[call-arg]
+            self.memory()  # type: ignore[call-arg]
+
+            if self._view_mode is AustinViewMode.GRAPH:
+                self.view.flamegraph.draw()
+            else:
+                if not self.model.austin.threads:
+                    self.view.table.set_data([])
+                self.view.table.draw()
+
+        if self.view.root_widget is not None:
+            self.view.root_widget.refresh()
 
     async def stop(self) -> None:
         """Called when Austin exits: cancel the update task and mark the view stopped.
@@ -486,7 +801,7 @@ class AustinTUIController:
 
     async def on_play_pause(self, _: Any = None) -> bool:
         """On play/pause handler."""
-        if self.view._stopped:
+        if self.view._stopped or self._file_mode:
             return False
 
         self.model.toggle_freeze()
@@ -495,6 +810,24 @@ class AustinTUIController:
             "Paused" if self.model.frozen else "Resumed"
         )
         return True
+
+    async def on_cancel_load(self, _: Any = None) -> bool:
+        """Cancel an in-progress file load."""
+        if (
+            self.model.file_state is not FileLoadState.LOADING
+            or self._cancel_event is None
+        ):
+            return False
+
+        self._cancel_event.set()
+        if self._load_queue is not None:
+            try:
+                self._load_queue.put_nowait(_CANCEL)
+            except asyncio.QueueFull:
+                # Consumer will notice the cancel flag at the next batch.
+                pass
+
+        return False
 
     def _change_threshold(self, delta: float) -> float:
         self.model.austin.threshold += delta
@@ -539,6 +872,11 @@ class AustinTUIController:
     def shutdown(self) -> None:
         """Force quit: terminate Austin and close the view immediately."""
         try:
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+        except Exception:
+            pass
+        try:
             if self.austin is not None:
                 self.austin.terminate()
         except Exception:
@@ -565,12 +903,7 @@ class AustinTUIController:
 
     async def on_metadata(self, metadata: AustinMetadata) -> None:
         """Austin metadata received callback."""
-        if metadata.name == "mode":
-            self.view.set_mode(metadata.value)
-        elif metadata.name == "python":
-            self.view.set_python(metadata.value)
-        elif metadata.name == "duration":
-            self.model.system._duration = int(metadata.value) / 1e6
+        self._apply_metadata(metadata)
 
     async def on_terminate(self) -> None:
         """Austin terminate callback."""

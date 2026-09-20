@@ -293,9 +293,13 @@ class ThreadDataAdapter(BaseThreadDataAdapter):
         container = thread_stats.children
         frame_stats = []
         max_scale = (
-            system.max_memory
-            if self._view.mode == AustinProfileMode.MEMORY
-            else system.duration
+            (
+                system.max_memory
+                if self._view.mode == AustinProfileMode.MEMORY
+                else system.duration
+            )
+            or thread_stats.total
+            or 1
         )
 
         for frame in frames or []:
@@ -392,6 +396,9 @@ class ThreadTopDataAdapter(BaseThreadDataAdapter):
         thread_stats = austin.stats.processes[int(pid)].threads[
             ThreadInfo(thread, int(iid))
         ]
+        if not max_scale:
+            max_scale = thread_stats.total or 1
+
         if children := list(thread_stats.children.values()):
             for stats in children[:-1]:
                 _add_frame_stats(stats, set())
@@ -551,6 +558,9 @@ class ThreadFullDataAdapter(BaseThreadDataAdapter):
         thread_stats = austin.stats.processes[int(pid)].threads[
             ThreadInfo(thread, int(iid))
         ]
+        if not max_scale:
+            max_scale = thread_stats.total or 1
+
         if children := list(thread_stats.children.values()):
             for stats in children[:-1]:
                 _add_frame_stats(stats, "├─ ", "│  ", 0, thread_stats.children)
@@ -591,7 +601,8 @@ class FlameGraphAdapter(Adapter):
 
         cs = {}  # type: ignore[var-annotated]
         total = thread.total
-        total_pct = min(int(total / system.duration / 1e4), 100)
+        duration = system.duration or total / 1e6 or 1e-9
+        total_pct = min(int(total / duration / 1e4), 100)
         data: FlameGraphData = {
             f"THREAD {thread.label.iid}:{thread.label.thread} ⏲️  {fmt_time(total)} ({total_pct}%)": (
                 total,

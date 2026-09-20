@@ -85,11 +85,7 @@ class AustinModel:
         self._samples = 0
         self._invalids = 0
         self._last_stack: Dict[str, AustinSample] = {}
-        self._stats = AustinStats(
-            AustinStatsType.MEMORY
-            if self.mode is AustinProfileMode.MEMORY
-            else AustinStatsType.WALL
-        )
+        self._stats = AustinStats(AustinStatsType.WALL)
         self._stats.timestamp = time()
 
         self._austin_version: Optional[str] = None
@@ -119,10 +115,40 @@ class AustinModel:
         """Set the Austin metadata."""
         self.metadata = metadata
 
+    def add_metadata(self, name: str, value: str) -> None:
+        """Accumulate a metadata entry.
+
+        Metadata is collected in stream order, so that mode, duration and
+        compatibility information are established before samples are
+        consumed.
+        """
+        if self.metadata is None:
+            self.metadata = {}
+        self.metadata[name] = value
+
+    def set_mode(
+        self, mode: AustinProfileMode, stats_type: AustinStatsType
+    ) -> None:
+        """Set the profiling mode before samples are consumed.
+
+        The statistics container is (re)created with the matching stats type
+        so that samples are accumulated according to the right metrics. This
+        is safe to call only before any sample has been received.
+        """
+        assert self._samples == 0, (
+            "Cannot change mode after samples were collected"
+        )
+        self.mode = mode
+        self._stats = AustinStats(stats_type)
+        self._stats.timestamp = time()
+
     def update(self, sample: AustinSample) -> None:
         """Update current statistics with a new sample."""
         try:
-            if sample.metrics.time < 0:
+            if self.mode is AustinProfileMode.MEMORY:
+                if sample.metrics.memory is None:
+                    return
+            elif sample.metrics.time is None or sample.metrics.time < 0:
                 return
             self._stats.update(sample)
             self._stats.timestamp = time()
